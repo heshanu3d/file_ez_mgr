@@ -153,3 +153,24 @@ def test_sftp_trust_roundtrip_overwrite_and_delete(sftp_server, tmp_path):
     hosts.save(str(known))
     with pytest.raises(paramiko.BadHostKeyException):
         backend.connect()
+
+
+def test_sftp_closed_channel_reconnects(sftp_server, tmp_path):
+    port, root, key = sftp_server
+    known = tmp_path / 'known_hosts'
+    hosts = paramiko.HostKeys()
+    hosts.add(f'[127.0.0.1]:{port}', key.get_name(), key)
+    hosts.save(str(known))
+    (root / 'file.txt').write_text('still here')
+    backend = SFTPBackend(Profile(host='127.0.0.1', port=port, username='test'), 'secret', known)
+    try:
+        backend.connect()
+        assert not backend.ensure_connection()
+        backend.sftp.close()
+        assert backend.ensure_connection()
+        assert backend.stat('/file.txt').size == len('still here')
+        backend.client.close()
+        assert backend.ensure_connection()
+        assert backend.listdir('/')[0].name == 'file.txt'
+    finally:
+        backend.close()

@@ -95,8 +95,36 @@ class HostKeyRequired(Exception):
         super().__init__(f"首次连接 {hostname}\n{key.get_name()}\n{self.fingerprint}")
 
 
+def is_connection_error(error):
+    import paramiko
+    if isinstance(error, (paramiko.AuthenticationException, paramiko.BadHostKeyException)):
+        return False
+    if isinstance(error, (EOFError, ConnectionError, TimeoutError, paramiko.SSHException)):
+        return True
+    if isinstance(error, ftplib.error_temp):
+        return str(error).startswith("421")
+    return isinstance(error, OSError) and (
+        error.errno in {errno.EBADF, errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED,
+                        errno.ENOTCONN, errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH}
+        or "socket is closed" in str(error).lower())
+
+
 class Backend:
     browsable = True
+
+    def ping(self):
+        pass
+
+    def ensure_connection(self):
+        try:
+            self.ping()
+        except Exception as exc:
+            if not is_connection_error(exc):
+                raise
+            self.close()
+            self.connect()
+            return True
+        return False
 
     def join(self, parent, name):
         return posixpath.join(parent, safe_name(name))
@@ -139,6 +167,14 @@ class SFTPBackend(Backend):
         except Exception:
             client.close()
             raise
+
+    def ping(self):
+        if not self.client or not self.sftp:
+            raise ConnectionError("SFTP 尚未连接")
+        transport = self.client.get_transport()
+        if not transport or not transport.is_active() or self.sftp.get_channel().closed:
+            raise ConnectionError("SFTP 连接已断开")
+        self.sftp.normalize(".")
 
     def normalize(self, path):
         return self.sftp.normalize(remote_path(path))
@@ -222,6 +258,11 @@ class FTPBackend(Backend):
         except Exception:
             ftp.close()
             raise
+
+    def ping(self):
+        if not self.ftp or self.ftp.sock is None:
+            raise ConnectionError("FTP 连接已断开")
+        self.ftp.voidcmd("NOOP")
 
     def normalize(self, path):
         self.ftp.cwd(remote_path(path))

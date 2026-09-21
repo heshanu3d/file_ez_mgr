@@ -7,13 +7,14 @@ import tempfile
 import weakref
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QUrl, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel,
+from PyQt5.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPushButton, QSplitter,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from .backends import Cancelled, HostKeyRequired, create_backend, local_child, local_entries, safe_name
+from .backends import (Cancelled, HostKeyRequired, check_cancel, create_backend,
+                       is_connection_error, local_child, local_entries, safe_name)
 from .transfers import TransferEngine, TransferResult, delete_remote
 from .editor import MAX_EDIT_BYTES, RemoteEditor
 from .widgets import FilePane, HistoryComboBox
@@ -23,6 +24,7 @@ from .workers import WorkerQueue
 
 class SessionTab(QWidget):
     stateChanged = pyqtSignal(str)
+    connectionRecovered = pyqtSignal()
 
     def __init__(self, profile=None, password="", config_dir=None, parent=None,
                  *, auto_connect=True, local_dir=None, remote_dir=None):
@@ -40,6 +42,12 @@ class SessionTab(QWidget):
         self.edit_temp = tempfile.TemporaryDirectory(prefix="file-ez-edit-")
         self.queue = WorkerQueue(self)
         self.rows = {}
+        self.drag_cache = {}
+        self.drag_preparing = False
+        self.keepalive_timer = QTimer(self)
+        self.keepalive_timer.setInterval(30000)
+        self.keepalive_timer.timeout.connect(self.keep_connection_alive)
+        self.connectionRecovered.connect(self.connection_recovered)
         self.queue.started.connect(self.job_started)
         self.queue.progressed.connect(self.job_progress)
         self.queue.finished.connect(self.job_finished)
@@ -123,6 +131,7 @@ class SessionTab(QWidget):
         self.local.tree.customContextMenuRequested.connect(lambda point: self.context_menu(self.local, point))
         self.remote.tree.customContextMenuRequested.connect(lambda point: self.context_menu(self.remote, point))
         self.remote.tree.filesDropped.connect(self.upload_paths)
+        self.remote.tree.remoteDragRequested.connect(self.prepare_remote_drag)
         self.set_connected(False)
         initial = os.path.expanduser(local_dir or (profile.local_dir if profile else str(Path.home())))
         if not Path(initial).is_dir():
@@ -185,6 +194,10 @@ class SessionTab(QWidget):
 
     def set_connected(self, connected):
         self.connected = connected
+        if connected and self.backend and self.backend.browsable:
+            self.keepalive_timer.start()
+        else:
+            self.keepalive_timer.stop()
         self.upload_button.setEnabled(connected)
         self.download_button.setEnabled(connected)
         self.remote.setEnabled(connected)
@@ -192,8 +205,41 @@ class SessionTab(QWidget):
         if self.backend and not self.backend.browsable:
             self.download_button.setText("按路径下载…")
 
-    def submit(self, title, function, callback=None, failure=None, visible=True):
-        job = self.queue.submit(title, function, callback, failure or self.show_error, visible)
+    def connection_recovered(self):
+        if not self.closing:
+            self.connection_status.setText("● 已自动恢复连接")
+            self.stateChanged.emit("已连接")
+
+    def keep_connection_alive(self):
+        if self.closing or not self.connected or self.queue.jobs:
+            return
+        def failed(error):
+            if not self.closing:
+                self.connection_status.setText(f"连接不可用，30 秒后重试 · {error}")
+                self.stateChanged.emit("等待重连")
+        self.submit("连接保活", lambda cancel, progress: None, failure=failed, visible=False)
+
+    def submit(self, title, function, callback=None, failure=None, visible=True,
+               *, remote=True, retry_read=False):
+        use_connection = remote and self.backend is not None and self.connected
+        def guarded(cancel, progress):
+            if use_connection:
+                check_cancel(cancel)
+                if self.backend.ensure_connection():
+                    self.connectionRecovered.emit()
+            check_cancel(cancel)
+            try:
+                return function(cancel, progress)
+            except Exception as exc:
+                if not (use_connection and retry_read and is_connection_error(exc)):
+                    raise
+                check_cancel(cancel)
+                self.backend.close()
+                self.backend.connect()
+                self.connectionRecovered.emit()
+                check_cancel(cancel)
+                return function(cancel, progress)
+        job = self.queue.submit(title, guarded, callback, failure or self.show_error, visible)
         if visible:
             item = QTreeWidgetItem([title, "—", "等待中"])
             item.setData(0, Qt.UserRole, job.id)
@@ -263,7 +309,7 @@ class SessionTab(QWidget):
                 self.remote.note.setText("TFTP 无目录浏览功能。上传使用本地选中文件；下载请填写远端文件路径。\n连接可达性在实际传输时验证。")
                 self.remote.note.show()
                 self.remote.search.setEnabled(False)
-        self.submit("连接 " + self.profile.name, connect, ready, self.connection_failed, visible=False)
+        self.submit("连接 " + self.profile.name, connect, ready, self.connection_failed, visible=False, remote=False)
 
     def connection_failed(self, error):
         self.reconnect_button.setEnabled(True)
@@ -329,7 +375,7 @@ class SessionTab(QWidget):
             if sequence == self._listing_sequence:
                 self.remote.address.setText(self.remote.path)
                 self.show_error(error)
-        self.submit("读取远端目录", listing, apply, failed, visible=False)
+        self.submit("读取远端目录", listing, apply, failed, visible=False, retry_read=True)
 
     def upload_paths(self, paths):
         if not self.connected or not paths:
@@ -358,6 +404,63 @@ class SessionTab(QWidget):
             self.submit(f"上传 · {Path(path).name} → {target}", work,
                         lambda result: self.browse_remote(self.remote.path))
 
+    def prepare_remote_drag(self, entries):
+        if self.closing or not self.connected or self.drag_preparing:
+            return
+        if any(entry.is_dir or entry.is_link for entry in entries):
+            self.show_error("拖到其他应用目前支持普通文件，请不要选择文件夹或符号链接。")
+            return
+        key = tuple((entry.path, entry.size, entry.modified) for entry in entries)
+        cached = self.drag_cache.get(key)
+        if cached and all(path.is_file() for path in cached):
+            if self.remote.tree.drag_paths(cached) == Qt.CopyAction:
+                self.drag_cache.pop(key, None)
+            return
+        self.drag_preparing = True
+        self.connection_status.setText("正在准备拖出文件…完成后可再次拖拽；任务列表中可取消")
+        cache_root = self.config_dir / "drag-cache"
+        try:
+            cache_root.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="files-", dir=cache_root))
+        except OSError as exc:
+            self.drag_preparing = False
+            self.show_error(exc)
+            return
+        def work(cancel, progress):
+            paths = []
+            try:
+                for index, entry in enumerate(entries):
+                    check_cancel(cancel)
+                    info = self.backend.stat(entry.path)
+                    if not info or info.is_dir or info.is_link:
+                        raise ValueError(f"文件不存在或已不再是普通文件：{entry.path}")
+                    target = local_child(directory / str(index), entry.name)
+                    engine = TransferEngine(self.backend, cancel, progress)
+                    engine.download(entry.path, target)
+                    if not target.is_file():
+                        raise ValueError(f"未能准备文件：{entry.path}")
+                    paths.append(target)
+                return paths
+            except Exception:
+                shutil.rmtree(directory, ignore_errors=True)
+                raise
+        def ready(paths):
+            self.drag_preparing = False
+            if self.closing:
+                return
+            self.drag_cache[key] = paths
+            self.connection_status.setText("拖出文件已准备好，可再次拖到微信、飞书等窗口")
+            if QApplication.mouseButtons() & Qt.LeftButton:
+                if self.remote.tree.drag_paths(paths) == Qt.CopyAction:
+                    self.drag_cache.pop(key, None)
+        def failed(error):
+            self.drag_preparing = False
+            shutil.rmtree(directory, ignore_errors=True)
+            self.connection_status.setText("拖出准备已取消" if isinstance(error, Cancelled) else "拖出准备失败，可重试")
+            self.show_error(error)
+        self.submit("准备拖出 · " + ", ".join(entry.name for entry in entries),
+                    work, ready, failed, retry_read=True)
+
     def download_selected(self):
         if not self.connected:
             return
@@ -383,7 +486,7 @@ class SessionTab(QWidget):
                 return engine.result
             self.submit(f"下载 · {name} → {target.parent}", work,
                         lambda result, source=source, target=target, is_dir=is_dir:
-                        self.record_download(result, source, target, is_dir))
+                        self.record_download(result, source, target, is_dir), retry_read=True)
 
     def open_local(self, path):
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
@@ -408,7 +511,7 @@ class SessionTab(QWidget):
             self.edit_button.setEnabled(True)
             self.open_local(target)
             self.connection_status.setText("编辑后请在编辑器中保存，再点击「回传已编辑文件」")
-        self.submit("下载待编辑文件 · " + entry.name, work, ready)
+        self.submit("下载待编辑文件 · " + entry.name, work, ready, retry_read=True)
 
     def upload_edited(self):
         if not self.connected or not self.edited:
@@ -492,7 +595,7 @@ class SessionTab(QWidget):
             self.loading_editors.discard(entry.path)
             self.show_error(error)
         self.submit("打开远端编辑 · " + entry.path,
-                    lambda cancel, progress: read_remote(cancel, progress, snapshot), loaded, failed)
+                    lambda cancel, progress: read_remote(cancel, progress, snapshot), loaded, failed, retry_read=True)
 
     def context_menu(self, pane, point):
         entries = pane.tree.selected_entries()
@@ -534,7 +637,7 @@ class SessionTab(QWidget):
                     delete_remote(self.backend, entry, cancel)
             return f"已删除 {len(entries)} 项"
         self.submit("删除 · " + ", ".join(e.name for e in entries), work,
-                    lambda result: pane.refresh.emit())
+                    lambda result: pane.refresh.emit(), remote=not pane.local)
 
     def make_directory(self, pane):
         name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称")
@@ -551,10 +654,11 @@ class SessionTab(QWidget):
                 Path(target).mkdir()
             else:
                 self.backend.mkdir(target)
-        self.submit("新建文件夹 · " + name, work, lambda result: pane.refresh.emit())
+        self.submit("新建文件夹 · " + name, work, lambda result: pane.refresh.emit(), remote=not pane.local)
 
     def shutdown(self):
         self.closing = True
+        self.keepalive_timer.stop()
         for editor in list(self.remote_editors.values()):
             editor.force_close = True
             editor.close()

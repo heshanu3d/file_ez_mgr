@@ -404,3 +404,174 @@ sys.exit(app.exec_())
     assert state['active_index'] == 1
     assert len(state['tabs']) == 2
     assert state['tabs'][1]['local_dir'] == str(tmp_path)
+
+
+def test_stale_connection_recovers_for_edit_and_heartbeat(app, tmp_path, monkeypatch):
+    from test_protocols import ftp_server
+    from file_ez_mgr.config import Profile
+    from file_ez_mgr.session import SessionTab
+    from file_ez_mgr.backends import Entry
+    server = ftp_server.__wrapped__(tmp_path)
+    port, root = next(server)
+    (root / 'note.txt').write_text('reconnected')
+    errors = []
+    monkeypatch.setattr(SessionTab, 'show_error', lambda self, error: errors.append(error))
+    tab = SessionTab(Profile(protocol='ftp', host='127.0.0.1', port=port, username='test'),
+                     'secret', tmp_path / 'config')
+    def drain():
+        deadline = time.monotonic() + 6
+        while tab.queue.jobs and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert not tab.queue.jobs
+    try:
+        drain()
+        assert tab.keepalive_timer.isActive()
+        tab.backend.close()
+        tab.edit_remote_direct(Entry('note.txt', '/note.txt', False))
+        drain()
+        assert tab.remote_editors['/note.txt'].text.toPlainText() == 'reconnected'
+        tab.backend.close()
+        tab.keep_connection_alive()
+        drain()
+        assert tab.backend.ftp.sock is not None
+        assert '已自动恢复连接' in tab.connection_status.text()
+        # A connection loss after preflight must retry a read only once.
+        original = tab.backend.listdir
+        reads = []
+        def drop_once(path):
+            reads.append(path)
+            if len(reads) == 1:
+                raise ConnectionResetError('lost during listing')
+            return original(path)
+        monkeypatch.setattr(tab.backend, 'listdir', drop_once)
+        tab.browse_remote('/')
+        drain()
+        assert reads == ['/', '/']
+        reads.clear()
+        def always_disconnected(path):
+            reads.append(path)
+            raise ConnectionResetError('still disconnected')
+        monkeypatch.setattr(tab.backend, 'listdir', always_disconnected)
+        tab.browse_remote('/')
+        drain()
+        assert reads == ['/', '/']
+        assert len(errors) == 1
+        errors.clear()
+        monkeypatch.setattr(tab.backend, 'listdir', original)
+        # Mutating work must not be replayed after an ambiguous failure.
+        writes = []
+        def write_then_disconnect(cancel, progress):
+            writes.append('written')
+            raise ConnectionResetError('lost after write')
+        tab.submit('write', write_then_disconnect)
+        drain()
+        assert writes == ['written']
+        assert len(errors) == 1
+        errors.clear()
+        # Heartbeats must not queue up behind active work or show modal errors.
+        import threading
+        gate = threading.Event()
+        tab.queue.submit('busy', lambda cancel, progress: gate.wait(2))
+        tab.keep_connection_alive()
+        assert len(tab.queue.jobs) == 1
+        gate.set()
+        drain()
+        monkeypatch.setattr(tab.backend, 'ensure_connection', lambda: (_ for _ in ()).throw(ConnectionError('offline')))
+        tab.keep_connection_alive()
+        drain()
+        assert '30 秒后重试' in tab.connection_status.text()
+        assert not errors
+    finally:
+        tab.shutdown()
+        assert not tab.keepalive_timer.isActive()
+        try:
+            next(server)
+        except StopIteration:
+            pass
+
+
+def test_remote_drag_prepares_real_files_and_cancels(app, tmp_path, monkeypatch):
+    import threading
+    from test_protocols import ftp_server
+    from file_ez_mgr.config import Profile
+    from file_ez_mgr.session import SessionTab
+    from file_ez_mgr.backends import Entry
+    from file_ez_mgr import widgets
+    server = ftp_server.__wrapped__(tmp_path)
+    port, root = next(server)
+    (root / '中文 空格.txt').write_text('drag payload')
+    (root / 'other.bin').write_bytes(b'\x00\x01')
+    errors, delivered = [], []
+    monkeypatch.setattr(SessionTab, 'show_error', lambda self, error: errors.append(error))
+    monkeypatch.setattr(QApplication, 'mouseButtons', lambda: Qt.NoButton)
+    class Drag:
+        def __init__(self, parent):
+            pass
+        def setMimeData(self, mime):
+            self.mime = mime
+        def setPixmap(self, pixmap):
+            pass
+        def exec_(self, allowed, default):
+            assert allowed == default == Qt.CopyAction
+            delivered.extend(Path(url.toLocalFile()) for url in self.mime.urls())
+            assert all(url.isLocalFile() for url in self.mime.urls())
+            assert all(path.is_file() for path in delivered)
+            return Qt.CopyAction
+    monkeypatch.setattr(widgets, 'QDrag', Drag)
+    tab = SessionTab(Profile(protocol='ftp', host='127.0.0.1', port=port, username='test'),
+                     'secret', tmp_path / 'config')
+    def drain():
+        deadline = time.monotonic() + 6
+        while tab.queue.jobs and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert not tab.queue.jobs
+    try:
+        drain()
+        tree = tab.remote.tree
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            if not item.parent_entry:
+                item.setSelected(True)
+        assert not tree.selection_mime().hasUrls()
+        tab.backend.close()  # Preparing a drag also recovers a stale connection.
+        tree.startDrag(Qt.CopyAction)
+        drain()
+        assert not delivered
+        assert '已准备好' in tab.connection_status.text()
+        tree.startDrag(Qt.CopyAction)
+        assert {path.name for path in delivered} == {'中文 空格.txt', 'other.bin'}
+        assert next(p for p in delivered if p.suffix == '.txt').read_text() == 'drag payload'
+        assert not tab.drag_cache  # Next completed drag gets a fresh snapshot.
+        assert (root / '中文 空格.txt').exists()
+        gate = threading.Event()
+        tab.queue.submit('busy', lambda cancel, progress: gate.wait(2))
+        tree.startDrag(Qt.CopyAction)
+        pending = next(job for job in tab.queue.jobs.values() if job.title.startswith('准备拖出'))
+        pending.cancel.set()
+        gate.set()
+        drain()
+        assert not tab.drag_preparing
+        assert len(delivered) == 2
+        assert '已取消' in tab.connection_status.text()
+        errors.clear()
+        # A multi-file preparation must not expose a partially downloaded set.
+        tab.prepare_remote_drag([Entry('other.bin', '/other.bin', False),
+                                 Entry('missing.txt', '/missing.txt', False)])
+        drain()
+        assert len(errors) == 1
+        assert len(delivered) == 2
+        assert not tab.drag_cache
+        assert len(list((tmp_path / 'config' / 'drag-cache').iterdir())) == 1
+        errors.clear()
+        tab.prepare_remote_drag([Entry('folder', '/folder', True)])
+        assert len(errors) == 1
+        assert not tab.queue.jobs
+    finally:
+        tab.shutdown()
+        assert all(path.is_file() for path in delivered)
+        try:
+            next(server)
+        except StopIteration:
+            pass

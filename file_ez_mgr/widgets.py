@@ -53,6 +53,7 @@ class FileItem(QTreeWidgetItem):
 
 class FileTree(QTreeWidget):
     filesDropped = pyqtSignal(list)
+    remoteDragRequested = pyqtSignal(list)
 
     def __init__(self, local=False, parent=None):
         super().__init__(parent)
@@ -65,10 +66,10 @@ class FileTree(QTreeWidget):
         self.setSortingEnabled(True)
         self.sortByColumn(4, Qt.DescendingOrder)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.setDragEnabled(local)
+        self.setDragEnabled(True)
         self.setAcceptDrops(not local)
         self.setDropIndicatorShown(not local)
-        self.setDragDropMode(QAbstractItemView.DragOnly if local else QAbstractItemView.DropOnly)
+        self.setDragDropMode(QAbstractItemView.DragOnly if local else QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
         self.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.header().setMinimumSectionSize(50)
@@ -80,20 +81,32 @@ class FileTree(QTreeWidget):
 
     def selection_mime(self):
         mime = QMimeData()
-        mime.setUrls([QUrl.fromLocalFile(os.path.abspath(e.path)) for e in self.selected_entries()])
+        if self.local:
+            mime.setUrls([QUrl.fromLocalFile(os.path.abspath(e.path)) for e in self.selected_entries()])
         return mime
 
     def startDrag(self, supported_actions):
-        if not self.local or not self.selected_entries():
+        entries = self.selected_entries()
+        if not entries:
             return
+        if not self.local:
+            self.remoteDragRequested.emit(entries)
+            return
+        self.drag_paths([entry.path for entry in entries])
+
+    def drag_paths(self, paths):
+        if not paths:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(os.path.abspath(path)) for path in paths])
         drag = QDrag(self)
-        drag.setMimeData(self.selection_mime())
+        drag.setMimeData(mime)
         drag.setPixmap(self.style().standardIcon(QStyle.SP_FileIcon).pixmap(32, 32))
         # Copy-only prevents an external application's move action deleting sources.
-        drag.exec_(Qt.CopyAction, Qt.CopyAction)
+        return drag.exec_(Qt.CopyAction, Qt.CopyAction)
 
     def _can_drop(self, event):
-        return (not self.local and event.mimeData().hasUrls()
+        return (not self.local and event.source() is not self and event.mimeData().hasUrls()
                 and all(url.isLocalFile() for url in event.mimeData().urls()))
 
     def dragEnterEvent(self, event):
@@ -204,4 +217,4 @@ class FilePane(QFrame):
             if not hidden and not item.parent_entry:
                 visible += 1
         self.footer.setText(f"{visible} / {len(self.entries)} 项" +
-                            ("  ·  支持拖拽到其他应用" if self.local else ""))
+                            ("  ·  支持拖拽到其他应用" if self.local else "  ·  普通文件可拖出，先下载后交付"))
