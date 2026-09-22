@@ -150,8 +150,11 @@ class MainWindow(QMainWindow):
         self.configure(self.selected_profile())
 
     def configure(self, profile):
-        dialog = ConnectionDialog(profile, self)
-        if dialog.exec_() != QDialog.Accepted:
+        dialog = ConnectionDialog(profile, self, config_dir=self.store.directory)
+        result = dialog.exec_()
+        for index in range(self.tabs.count()):
+            self.tabs.widget(index).refresh_history()
+        if result != QDialog.Accepted:
             return
         new_profile = dialog.profile
         profiles = [new_profile if p.id == new_profile.id else p for p in self.profiles]

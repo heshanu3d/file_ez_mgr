@@ -162,7 +162,7 @@ class SessionTab(QWidget):
             return
         try:
             for item in self.history_store.load():
-                self.history.addItem(f"{item['name']} · {item['remote_dir']}", item)
+                self.history.addItem(f"{item['local_dir']} ← {item['remote_dir']}", item)
                 index = self.history.count() - 1
                 self.history.setItemData(index, f"本地：{item['local_dir']}\n远端：{item['remote_dir']}\n下载时间：{item['time']}", Qt.ToolTipRole)
                 if selected == item:
@@ -176,9 +176,7 @@ class SessionTab(QWidget):
         if result.files == 0 and result.skipped:
             return
         try:
-            self.history_store.record(posixpath.basename(source),
-                                      target if is_dir else target.parent,
-                                      source if is_dir else posixpath.dirname(source) or "/")
+            self.history_store.record(target.parent, posixpath.dirname(source) or "/")
             self.refresh_history()
         except Exception as exc:
             self.connection_status.setText(f"下载已完成，但历史保存失败：{exc}")

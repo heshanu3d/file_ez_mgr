@@ -271,15 +271,28 @@ def test_download_history_and_default_overwrite_without_confirmation(app, tmp_pa
         assert (local / "项目" / "file.txt").read_text() == "remote new"
         history = DownloadHistory(tmp_path / "config", profile).load()
         assert len(history) == 1
-        assert history[0]["local_dir"] == str(local / "项目")
-        assert history[0]["remote_dir"] == "/项目"
+        assert history[0]["local_dir"] == str(local)
+        assert history[0]["remote_dir"] == "/"
         tab.local.search.setText("no matches")
         tab.remote.search.setText("no matches")
         tab.restore_history(1)
         drain()
-        assert tab.local.path == str(local / "项目")
-        assert tab.remote.path == "/项目"
+        assert tab.local.path == str(local)
+        assert tab.remote.path == "/"
         assert tab.local.search.text() == tab.remote.search.text() == ""
+        # A file and folder from the same parent pair share one history item.
+        (root / "sibling.txt").write_text("sibling")
+        tab.browse_remote("/")
+        drain()
+        select("sibling.txt")
+        tab.download_selected()
+        drain()
+        history = DownloadHistory(tmp_path / "config", profile).load()
+        assert len(history) == 1
+        assert history[0]["local_dir"] == str(local)
+        assert history[0]["remote_dir"] == "/"
+        tab.browse_remote("/项目")
+        drain()
         # Upload also overwrites silently by default.
         (local / "项目" / "file.txt").write_text("uploaded change")
         tab.upload_paths([str(local / "项目" / "file.txt")])
@@ -620,3 +633,43 @@ def test_address_bar_home_paths(app, tmp_path, monkeypatch):
             next(server)
         except StopIteration:
             pass
+
+
+def test_settings_history_multi_delete_and_corrupt_file(app, tmp_path, monkeypatch):
+    from file_ez_mgr.config import Profile
+    from file_ez_mgr.dialogs import ConnectionDialog, DownloadHistoryDialog
+    from file_ez_mgr.history import DownloadHistory
+    from PyQt5.QtWidgets import QDialog
+    profile = Profile(host='server')
+    store = DownloadHistory(tmp_path, profile)
+    for n in range(3):
+        store.record(f'/local/{n}', f'/remote/{n}')
+    settings = ConnectionDialog(profile, config_dir=tmp_path)
+    assert settings.history_button.isEnabled()
+    opened = []
+    monkeypatch.setattr(DownloadHistoryDialog, 'exec_', lambda self: opened.append(self.store.path) or QDialog.Rejected)
+    settings.history_button.click()
+    assert opened == [store.path]
+    dialog = DownloadHistoryDialog(store)
+    assert dialog.records.topLevelItemCount() == 3
+    assert not dialog.delete_button.isEnabled()
+    dialog.records.topLevelItem(0).setSelected(True)
+    dialog.records.topLevelItem(2).setSelected(True)
+    assert dialog.delete_button.isEnabled()
+    # Preserve an unselected download completed after the dialog opened.
+    store.record('/new', '/new')
+    dialog.delete_button.click()
+    assert [i['local_dir'] for i in store.load()] == ['/new', '/local/1']
+    assert dialog.records.topLevelItemCount() == 2
+    dialog.records.selectAll()
+    dialog.delete_button.click()
+    assert store.load() == []
+    assert dialog.status.text() == '暂无下载历史'
+    assert not dialog.delete_button.isEnabled()
+    store.path.write_text('broken')
+    dialog.refresh()
+    assert '读取失败' in dialog.status.text()
+    assert not dialog.delete_button.isEnabled()
+    assert store.path.read_text() == 'broken'
+    dialog.close()
+    settings.close()
