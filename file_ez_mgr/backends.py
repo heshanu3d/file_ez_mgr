@@ -112,6 +112,14 @@ def is_connection_error(error):
 class Backend:
     browsable = True
 
+    def expand_home(self, path):
+        path = remote_path(path)
+        if path == "~":
+            return self.home_dir
+        if path.startswith("~/"):
+            return posixpath.join(self.home_dir, path[2:].lstrip("/"))
+        return path
+
     def ping(self):
         pass
 
@@ -163,6 +171,7 @@ class SFTPBackend(Backend):
             self.sftp = client.open_sftp()
             self.sftp.get_channel().settimeout(15)
             client.get_transport().set_keepalive(30)
+            self.home_dir = self.sftp.normalize(".")
             return self.normalize(p.remote_dir or ".")
         except Exception:
             client.close()
@@ -177,7 +186,7 @@ class SFTPBackend(Backend):
         self.sftp.normalize(".")
 
     def normalize(self, path):
-        return self.sftp.normalize(remote_path(path))
+        return self.sftp.normalize(self.expand_home(path))
 
     def _entry(self, path, info):
         return Entry(posixpath.basename(path), path, stat.S_ISDIR(info.st_mode),
@@ -254,6 +263,7 @@ class FTPBackend(Backend):
             if p.protocol == "ftps":
                 ftp.prot_p()
             ftp.set_pasv(p.passive)
+            self.home_dir = ftp.pwd()
             return self.normalize(p.remote_dir or ".")
         except Exception:
             ftp.close()
@@ -265,7 +275,7 @@ class FTPBackend(Backend):
         self.ftp.voidcmd("NOOP")
 
     def normalize(self, path):
-        self.ftp.cwd(remote_path(path))
+        self.ftp.cwd(self.expand_home(path))
         return self.ftp.pwd()
 
     def listdir(self, path):

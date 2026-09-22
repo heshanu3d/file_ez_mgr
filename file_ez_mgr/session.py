@@ -364,7 +364,8 @@ class SessionTab(QWidget):
             return
         self._listing_sequence += 1
         sequence = self._listing_sequence
-        requested = path if path.startswith("/") else posixpath.join(self.remote.path or ".", path)
+        from_home = path == "~" or path.startswith("~/")
+        requested = path if path.startswith("/") or from_home else posixpath.join(self.remote.path or ".", path)
         def listing(cancel, progress):
             normalized = self.backend.normalize(requested)
             return normalized, self.backend.listdir(normalized)

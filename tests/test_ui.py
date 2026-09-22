@@ -575,3 +575,48 @@ def test_remote_drag_prepares_real_files_and_cancels(app, tmp_path, monkeypatch)
             next(server)
         except StopIteration:
             pass
+
+
+def test_address_bar_home_paths(app, tmp_path, monkeypatch):
+    from test_protocols import ftp_server
+    from file_ez_mgr.config import Profile
+    from file_ez_mgr.session import SessionTab
+    home = tmp_path / 'home'
+    home.mkdir()
+    (home / '中文 目录').mkdir()
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('USERPROFILE', str(home))
+    server = ftp_server.__wrapped__(tmp_path)
+    port, root = next(server)
+    (root / 'nested').mkdir()
+    (root / '中文 目录').mkdir()
+    failures = []
+    monkeypatch.setattr(SessionTab, 'show_error', lambda self, error: failures.append(error))
+    tab = SessionTab(Profile(protocol='ftp', host='127.0.0.1', port=port, username='test',
+                             remote_dir='/nested'), 'secret', tmp_path / 'config')
+    def drain():
+        deadline = time.monotonic() + 6
+        while tab.queue.jobs and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        assert not tab.queue.jobs
+        assert not failures
+    try:
+        drain()
+        for text, expected in [('~', home), ('~/中文 目录', home / '中文 目录')]:
+            tab.local.address.setText(text)
+            tab.local.address.returnPressed.emit()
+            assert Path(tab.local.path) == expected
+        assert tab.remote.path == '/nested'
+        for text, expected in [('~', '/'), ('~/中文 目录', '/中文 目录'), ('~/nested', '/nested'), ('~/', '/')]:
+            tab.remote.address.setText(text)
+            tab.remote.address.returnPressed.emit()
+            drain()
+            assert tab.remote.path == expected
+            assert tab.remote.address.text() == expected
+    finally:
+        tab.shutdown()
+        try:
+            next(server)
+        except StopIteration:
+            pass

@@ -110,3 +110,21 @@ def test_real_tftp_roundtrip(tmp_path):
     finally:
         server.stop(now=True)
         thread.join(timeout=5)
+
+
+def test_ftp_home_paths_after_navigation(ftp_server, tmp_path):
+    port, root = ftp_server
+    (root / 'initial').mkdir()
+    (root / '中文 目录').mkdir()
+    backend = FTPBackend(Profile(protocol='ftp', host='127.0.0.1', port=port,
+                                 username='test', remote_dir='~/initial'), 'secret')
+    try:
+        assert backend.connect() == '/initial'
+        assert backend.normalize('~') == '/'
+        assert backend.normalize('~/中文 目录') == '/中文 目录'
+        assert backend.normalize('~//initial') == '/initial'
+        backend.close()
+        assert backend.ensure_connection()
+        assert backend.normalize('~/') == '/'
+    finally:
+        backend.close()

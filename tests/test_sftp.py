@@ -174,3 +174,21 @@ def test_sftp_closed_channel_reconnects(sftp_server, tmp_path):
         assert backend.listdir('/')[0].name == 'file.txt'
     finally:
         backend.close()
+
+
+def test_sftp_home_paths(sftp_server, tmp_path):
+    port, root, key = sftp_server
+    known = tmp_path / 'known_hosts'
+    hosts = paramiko.HostKeys()
+    hosts.add(f'[127.0.0.1]:{port}', key.get_name(), key)
+    hosts.save(str(known))
+    (root / 'initial').mkdir()
+    backend = SFTPBackend(Profile(host='127.0.0.1', port=port, username='test',
+                                  remote_dir='~/initial'), 'secret', known)
+    try:
+        assert backend.connect() == '/initial'
+        assert backend.normalize('~') == '/'
+        assert backend.normalize('~/initial') == '/initial'
+        assert backend.normalize('~/') == '/'
+    finally:
+        backend.close()
