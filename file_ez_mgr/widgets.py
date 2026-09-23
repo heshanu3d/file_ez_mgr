@@ -71,9 +71,10 @@ class FileTree(QTreeWidget):
         self.setDropIndicatorShown(not local)
         self.setDragDropMode(QAbstractItemView.DragOnly if local else QAbstractItemView.DragDrop)
         self.setDefaultDropAction(Qt.CopyAction)
-        self.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.header().setSectionResizeMode(QHeaderView.Interactive)
+        self.header().setStretchLastSection(False)
         self.header().setMinimumSectionSize(50)
-        for column, width in [(1, 78), (2, 80), (3, 88), (4, 145)]:
+        for column, width in [(0, 240), (1, 78), (2, 80), (3, 88), (4, 145)]:
             self.setColumnWidth(column, width)
 
     def selected_entries(self):
