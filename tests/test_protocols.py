@@ -128,3 +128,33 @@ def test_ftp_home_paths_after_navigation(ftp_server, tmp_path):
         assert backend.normalize('~/') == '/'
     finally:
         backend.close()
+
+
+def test_real_ftp_folder_reports_scanned_totals(ftp_server, tmp_path):
+    port, root = ftp_server
+    backend = FTPBackend(Profile(protocol='ftp', host='127.0.0.1', port=port,
+                                 username='test'), 'secret')
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'a.txt').write_bytes(b'a' * 4096)
+    (source / 'sub').mkdir()
+    (source / 'sub' / 'b.txt').write_bytes(b'b' * 1024)
+    events = []
+    try:
+        backend.connect()
+        upload = TransferEngine(backend, threading.Event(), lambda *_: None,
+                                detail=events.append)
+        upload.upload(source, '/source')
+        assert upload.result.files == 2
+        assert events[-1].files_done == events[-1].files_total == 2
+        assert events[-1].bytes_total == 5120
+        events.clear()
+        download = TransferEngine(backend, threading.Event(), lambda *_: None,
+                                  detail=events.append)
+        download.download('/source', tmp_path / 'received')
+        assert download.result.files == 2
+        assert events[-1].files_done == events[-1].files_total == 2
+        assert events[-1].bytes_done == events[-1].bytes_total == 5120
+        assert (tmp_path / 'received' / 'sub' / 'b.txt').read_bytes() == b'b' * 1024
+    finally:
+        backend.close()

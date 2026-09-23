@@ -180,3 +180,54 @@ def test_destination_link_still_protected(tmp_path, direction):
         getattr(engine(conflict="overwrite"), direction)(source, target)
     assert outside.read_text() == "original"
     assert target.is_symlink()
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_directory_progress_reports_total_files_sizes_and_skips(tmp_path, direction):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "folder").mkdir()
+    (source / "folder" / "中文.txt").write_bytes(b"a" * 4096)
+    (source / "empty.txt").touch()
+    (source / "empty-dir").mkdir()
+    destination = tmp_path / "destination"
+    events = []
+    transfer = TransferEngine(DiskBackend(), threading.Event(), lambda *_: None,
+                              detail=events.append)
+    getattr(transfer, direction)(source if direction == "upload" else str(source),
+                                  str(destination) if direction == "upload" else destination)
+    scans = [event for event in events if event.stage == "scanning"]
+    assert scans and scans[-1].files_total == 2
+    assert scans[-1].bytes_total == 4096
+    starts = [event for event in events if event.stage == "transferring" and event.path and event.file_done == 0]
+    assert {Path(event.path).name for event in starts} == {"中文.txt", "empty.txt"}
+    assert {event.file_size for event in starts} == {4096, 0}
+    assert events[-1].files_done == events[-1].files_total == 2
+    assert events[-1].bytes_done == events[-1].bytes_total == 4096
+    assert (destination / "folder" / "中文.txt").read_bytes() == b"a" * 4096
+    assert (destination / "empty-dir").is_dir()
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+def test_directory_progress_empty_and_skip(tmp_path, direction):
+    source = tmp_path / "source"
+    (source / "empty").mkdir(parents=True)
+    destination = tmp_path / "destination"
+    events = []
+    transfer = TransferEngine(DiskBackend(), threading.Event(), lambda *_: None,
+                              detail=events.append)
+    getattr(transfer, direction)(source if direction == "upload" else str(source),
+                                  str(destination) if direction == "upload" else destination)
+    assert events[-1].files_total == 0
+    assert (destination / "empty").is_dir()
+    (source / "file.txt").write_bytes(b"new")
+    (destination / "file.txt").write_bytes(b"old")
+    events.clear()
+    transfer = TransferEngine(DiskBackend(), threading.Event(), lambda *_: None,
+                              conflict="skip", detail=events.append)
+    getattr(transfer, direction)(source if direction == "upload" else str(source),
+                                  str(destination) if direction == "upload" else destination)
+    assert transfer.result.skipped == 1
+    assert events[-1].stage == "skipped"
+    assert events[-1].files_done == events[-1].files_total == 1
+    assert (destination / "file.txt").read_bytes() == b"old"

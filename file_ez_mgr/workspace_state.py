@@ -15,6 +15,13 @@ class WorkspaceStateStore:
         state = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(state, dict) or state.get("version") != 1:
             raise ValueError("窗口记录格式或版本不受支持")
+        geometry = state.get("geometry")
+        if geometry is not None and (not isinstance(geometry, dict)
+                or type(geometry.get("width")) is not int or type(geometry.get("height")) is not int
+                or not 980 <= geometry["width"] <= 16384
+                or not 650 <= geometry["height"] <= 16384
+                or type(geometry.get("maximized")) is not bool):
+            raise ValueError("窗口尺寸记录格式错误")
         tabs = state.get("tabs")
         if not isinstance(tabs, list) or not isinstance(state.get("active_index"), int):
             raise ValueError("窗口标签记录格式错误")
@@ -31,8 +38,10 @@ class WorkspaceStateStore:
                 raise ValueError("窗口传输设置格式错误")
         return state
 
-    def save(self, tabs, active_index, selected_profile):
+    def save(self, tabs, active_index, selected_profile, geometry=None):
         state = dict(version=1, tabs=tabs, active_index=active_index, selected_profile=selected_profile)
+        if geometry is not None:
+            state["geometry"] = geometry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=".workspace-", dir=self.path.parent)
         try:

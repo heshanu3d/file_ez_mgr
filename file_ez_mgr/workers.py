@@ -25,6 +25,7 @@ class Job:
 class WorkerQueue(QObject):
     started = pyqtSignal(str)
     progressed = pyqtSignal(str, int, int)
+    detailed = pyqtSignal(str, object)
     finished = pyqtSignal(str, object, object)
     idle = pyqtSignal()
 
@@ -46,6 +47,8 @@ class WorkerQueue(QObject):
     def _run(self, job):
         self.started.emit(job.id)
         last = 0
+        detail_last = 0
+        detail_path = ""
         def progress(done, total):
             nonlocal last
             now = time.monotonic()
@@ -53,6 +56,17 @@ class WorkerQueue(QObject):
                 # Python object integers avoid Qt's signed 32-bit byte limit.
                 self.progressed.emit(job.id, min(10000, int(done / total * 10000)) if total else 0, 10000)
                 last = now
+        def detail(status):
+            nonlocal detail_last, detail_path
+            now = time.monotonic()
+            scanning_due = status.stage == "scanning" and (not detail_last or now - detail_last >= 0.1)
+            transfer_due = (status.stage == "transferring"
+                            and (status.path != detail_path or now - detail_last >= 0.1
+                                 or bool(status.path) and status.file_done == status.file_size))
+            if status.stage == "skipped" or scanning_due or transfer_due:
+                self.detailed.emit(job.id, status)
+                detail_last, detail_path = now, status.path
+        progress.detail = detail
         try:
             check_cancel(job.cancel)
             value = job.function(job.cancel, progress)

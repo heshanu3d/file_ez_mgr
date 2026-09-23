@@ -673,3 +673,78 @@ def test_settings_history_multi_delete_and_corrupt_file(app, tmp_path, monkeypat
     assert store.path.read_text() == 'broken'
     dialog.close()
     settings.close()
+
+
+def test_window_geometry_saved_on_resize_and_maximize(app, tmp_path):
+    from file_ez_mgr.workspace_state import WorkspaceStateStore
+    directory = tmp_path / 'config'
+    window = MainWindow(directory)
+    window.show()
+    app.processEvents()
+    window.resize(1120, 740)
+    app.processEvents()
+    assert window._geometry_save.isActive()
+    window._geometry_save.stop()
+    window.save_workspace()
+    assert WorkspaceStateStore(directory).load()['geometry'] == {
+        'width': 1120, 'height': 740, 'maximized': False}
+    window.showMaximized()
+    app.processEvents()
+    assert window._geometry_save.isActive()
+    assert window.close()
+    state = WorkspaceStateStore(directory).load()
+    assert state['geometry']['maximized'] is True
+    assert state['geometry']['width'] == 1120
+    assert state['geometry']['height'] == 740
+    restored = MainWindow(directory)
+    try:
+        restored.show()
+        app.processEvents()
+        assert restored.isMaximized()
+        restored.showNormal()
+        app.processEvents()
+        assert restored.size().width() == 1120
+        assert restored.size().height() == 740
+    finally:
+        restored.close()
+
+
+def test_window_resize_timer_writes_while_running(app, tmp_path):
+    from file_ez_mgr.workspace_state import WorkspaceStateStore
+    window = MainWindow(tmp_path)
+    window.show()
+    app.processEvents()
+    window.resize(1080, 700)
+    app.processEvents()
+    assert window._geometry_save.isActive()
+    window._geometry_save.setInterval(0)
+    deadline = time.monotonic() + 2
+    while not (tmp_path / 'workspace.json').exists() and time.monotonic() < deadline:
+        app.processEvents()
+    try:
+        assert WorkspaceStateStore(tmp_path).load()['geometry']['width'] == 1080
+    finally:
+        window.close()
+
+
+def test_transfer_row_shows_file_and_folder_totals(app, tmp_path):
+    from file_ez_mgr.session import SessionTab
+    from file_ez_mgr.transfers import TransferProgress, TransferResult
+    tab = SessionTab(config_dir=tmp_path)
+    try:
+        job = tab.submit('上传 · folder', lambda cancel, progress: None)
+        item = tab.rows[job.id]
+        tab.job_detail(job.id, TransferProgress('scanning', '/src/folder/a.txt', files_total=2, bytes_total=4096))
+        assert '扫描中' in item.text(1)
+        tab.job_detail(job.id, TransferProgress('transferring', '/src/folder/a.txt', 4096, 1024,
+                                                0, 2, 0, 4096))
+        assert item.text(1).startswith('0/2 · 25%')
+        assert 'a.txt' in item.text(2) and '1.0 KB / 4.0 KB' in item.text(2)
+        assert item.toolTip(2) == '/src/folder/a.txt'
+        tab.job_detail(job.id, TransferProgress('transferring', '/src/folder/b.txt', 0, 0,
+                                                1, 2, 4096, 4096))
+        assert '1/2' in item.text(1) and '99%' in item.text(1)
+        tab.job_finished(job.id, TransferResult(files=2), None)
+        assert item.text(1) == '2/2 · 100%'
+    finally:
+        tab.shutdown()

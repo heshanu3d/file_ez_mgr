@@ -9,15 +9,15 @@ from pathlib import Path
 
 from PyQt5.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QInputDialog, QLabel,
+from PyQt5.QtWidgets import (QApplication, QComboBox, QFrame, QHeaderView, QHBoxLayout, QInputDialog, QLabel,
                              QLineEdit, QMenu, QMessageBox, QPushButton, QSplitter,
                              QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .backends import (Cancelled, HostKeyRequired, check_cancel, create_backend,
                        is_connection_error, local_child, local_entries, safe_name)
-from .transfers import TransferEngine, TransferResult, delete_remote
+from .transfers import TransferEngine, TransferProgress, TransferResult, delete_remote
 from .editor import MAX_EDIT_BYTES, RemoteEditor
-from .widgets import FilePane, HistoryComboBox
+from .widgets import FilePane, HistoryComboBox, size_text
 from .history import DownloadHistory
 from .workers import WorkerQueue
 
@@ -42,6 +42,7 @@ class SessionTab(QWidget):
         self.edit_temp = tempfile.TemporaryDirectory(prefix="file-ez-edit-")
         self.queue = WorkerQueue(self)
         self.rows = {}
+        self.transfer_totals = {}
         self.drag_cache = {}
         self.drag_preparing = False
         self.keepalive_timer = QTimer(self)
@@ -50,6 +51,7 @@ class SessionTab(QWidget):
         self.connectionRecovered.connect(self.connection_recovered)
         self.queue.started.connect(self.job_started)
         self.queue.progressed.connect(self.job_progress)
+        self.queue.detailed.connect(self.job_detail)
         self.queue.finished.connect(self.job_finished)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 12, 0, 0)
@@ -112,11 +114,12 @@ class SessionTab(QWidget):
             toolbar.addWidget(button)
         qlayout.addLayout(toolbar)
         self.jobs_view = QTreeWidget()
-        self.jobs_view.setHeaderLabels(["任务", "进度", "状态 / 结果"])
+        self.jobs_view.setHeaderLabels(["任务", "总进度", "当前文件 / 状态"])
         self.jobs_view.setRootIsDecorated(False)
         self.jobs_view.setSelectionMode(QTreeWidget.ExtendedSelection)
-        self.jobs_view.setColumnWidth(0, 430)
-        self.jobs_view.setColumnWidth(1, 90)
+        self.jobs_view.setColumnWidth(0, 350)
+        self.jobs_view.setColumnWidth(1, 155)
+        self.jobs_view.header().setSectionResizeMode(2, QHeaderView.Stretch)
         qlayout.addWidget(self.jobs_view)
         vertical.addWidget(queue_panel)
         vertical.setSizes([510, 190])
@@ -251,8 +254,42 @@ class SessionTab(QWidget):
             self.rows[job_id].setText(2, "进行中")
 
     def job_progress(self, job_id, done, total):
-        if job_id in self.rows:
+        if job_id in self.rows and job_id not in self.transfer_totals:
             self.rows[job_id].setText(1, f"{done / total:.0%}" if total else "…")
+
+    def job_detail(self, job_id, status):
+        if job_id not in self.rows or not isinstance(status, TransferProgress):
+            return
+        item = self.rows[job_id]
+        if status.stage == "scanning":
+            item.setText(1, f"扫描中 · {status.files_total} 个")
+            item.setText(2, f"正在统计：{Path(status.path).name}" if status.path else "正在统计文件…")
+        else:
+            self.transfer_totals[job_id] = status.files_total
+            current = status.files_done if not status.path else min(
+                status.files_done + (0 if status.stage == "skipped" else 1), status.files_total)
+            if status.files_total == 0:
+                item.setText(1, "0 个文件")
+            else:
+                overall = ((status.bytes_done + status.file_done) / status.bytes_total
+                           if status.bytes_total else status.files_done / status.files_total)
+                percent = min(100 if status.files_done == status.files_total else 99,
+                              max(0, round(overall * 100)))
+                item.setText(1, f"{status.files_done}/{status.files_total} · {percent}%")
+            if status.path:
+                name = Path(status.path).name or status.path
+                if status.stage == "skipped":
+                    item.setText(2, f"已跳过 {name} · {size_text(status.file_size)}")
+                else:
+                    item.setText(2, f"{name} ({current}/{status.files_total}) · "
+                                    f"{size_text(status.file_done)} / {size_text(status.file_size)}")
+            else:
+                item.setText(2, "文件夹为空，正在创建目录…" if not status.files_total else "准备传输…")
+        item.setToolTip(1, f"已处理 {status.files_done} / {status.files_total} 个文件；"
+                           f"已处理大小 {size_text(status.bytes_done + status.file_done)} / "
+                           f"{size_text(status.bytes_total)}")
+        if status.path:
+            item.setToolTip(2, status.path)
 
     def job_finished(self, job_id, value, error):
         if job_id in self.rows:
@@ -261,10 +298,12 @@ class SessionTab(QWidget):
                 item.setText(2, "已取消" if isinstance(error, Cancelled) else "失败：" + str(error))
                 item.setToolTip(2, str(error))
             else:
-                item.setText(1, "100%")
+                total_files = self.transfer_totals.get(job_id)
+                item.setText(1, f"{total_files}/{total_files} · 100%" if total_files is not None else "100%")
                 item.setText(2, str(value) if value else "完成")
                 if isinstance(value, TransferResult):
                     item.setToolTip(2, value.details)
+        self.transfer_totals.pop(job_id, None)
         if not self.queue.jobs and not self.closing:
             self.browse_local(self.local.path)
 
@@ -279,6 +318,7 @@ class SessionTab(QWidget):
         for job_id in list(self.rows):
             if job_id not in self.queue.jobs:
                 item = self.rows.pop(job_id)
+                self.transfer_totals.pop(job_id, None)
                 self.jobs_view.takeTopLevelItem(self.jobs_view.indexOfTopLevelItem(item))
 
     def connect_remote(self):
@@ -397,7 +437,7 @@ class SessionTab(QWidget):
         conflict = self.conflict.currentData()
         for path, target in zip(paths, destinations):
             def work(cancel, progress, source=Path(path), destination=target):
-                engine = TransferEngine(self.backend, cancel, progress, conflict)
+                engine = TransferEngine(self.backend, cancel, progress, conflict, detail=progress.detail)
                 engine.upload(source, destination)
                 return engine.result
             self.submit(f"上传 · {Path(path).name} → {target}", work,
@@ -480,7 +520,7 @@ class SessionTab(QWidget):
                 self.show_error(exc)
                 return
             def work(cancel, progress, source=source, target=target):
-                engine = TransferEngine(self.backend, cancel, progress, conflict)
+                engine = TransferEngine(self.backend, cancel, progress, conflict, detail=progress.detail)
                 engine.download(source, target)
                 return engine.result
             self.submit(f"下载 · {name} → {target.parent}", work,

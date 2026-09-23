@@ -34,15 +34,117 @@ class TransferResult:
         return summary
 
 
+@dataclass(frozen=True)
+class TransferProgress:
+    stage: str
+    path: str = ""
+    file_size: int = 0
+    file_done: int = 0
+    files_done: int = 0
+    files_total: int = 0
+    bytes_done: int = 0
+    bytes_total: int = 0
+
+
 class TransferEngine:
     """Runs only on the session worker; a session serializes every backend call."""
-    def __init__(self, backend, cancel: threading.Event, progress, conflict="overwrite"):
+    def __init__(self, backend, cancel: threading.Event, progress, conflict="overwrite", detail=None):
         self.backend, self.cancel, self.progress, self.conflict = backend, cancel, progress, conflict
+        self.detail = detail
         self.result = TransferResult()
+        self._prepared = False
+        self._files_total = self._files_done = 0
+        self._bytes_total = self._bytes_done = 0
+        self._planned_sizes = {}
+        self._current_size = self._current_done = 0
+
+    def _report(self, stage, path=""):
+        if self.detail:
+            self.detail(TransferProgress(stage, str(path), self._current_size, self._current_done,
+                                         self._files_done, self._files_total,
+                                         self._bytes_done, self._bytes_total))
+
+    def _scan_upload(self, source):
+        check_cancel(self.cancel)
+        if source.is_symlink():
+            return
+        if source.is_dir():
+            for child in sorted(source.iterdir()):
+                self._scan_upload(child)
+        elif source.is_file():
+            self._count(source, source.stat().st_size)
+        else:
+            raise ValueError(f"不支持此文件类型：{source}")
+
+    def _scan_download(self, source):
+        check_cancel(self.cancel)
+        if not self.backend.browsable:
+            return
+        entry = self.backend.stat(source)
+        if entry is None:
+            raise FileNotFoundError(source)
+        self._scan_entry(entry)
+
+    def _scan_entry(self, entry):
+        check_cancel(self.cancel)
+        if entry.is_link:
+            return
+        if entry.is_dir:
+            for child in self.backend.listdir(entry.path):
+                self._scan_entry(child)
+        else:
+            self._count(entry.path, entry.size)
+
+    def _count(self, path, size):
+        self._planned_sizes[str(path)] = max(0, size)
+        self._files_total += 1
+        self._bytes_total += max(0, size)
+        self._report("scanning", path)
+
+    def _prepare(self, source, direction):
+        if self._prepared or not self.detail:
+            return
+        self._report("scanning", source)
+        if direction == "upload":
+            self._scan_upload(source)
+        else:
+            self._scan_download(source)
+        self._prepared = True
+        self._report("transferring")
+
+    def _start_file(self, path, size):
+        if not self.detail:
+            return self.progress
+        path = str(path)
+        planned = self._planned_sizes.get(path)
+        if planned is None:
+            self._files_total += 1
+            planned = 0
+        size = max(0, size)
+        self._bytes_total += size - planned
+        self._current_size, self._current_done = size, 0
+        self._report("transferring", path)
+
+        def update(done, total):
+            self.progress(done, total)
+            if total != self._current_size:
+                self._bytes_total += max(0, total) - self._current_size
+                self._current_size = max(0, total)
+            self._current_done = min(max(0, done), self._current_size)
+            self._report("transferring", path)
+        return update
+
+    def _complete_file(self, path, skipped=False):
+        if self.detail:
+            self._bytes_done += self._current_size
+            self._files_done += 1
+            self._current_done = self._current_size
+            self._report("skipped" if skipped else "transferring", path)
 
     def upload(self, source: Path, target: str):
         check_cancel(self.cancel)
         source = Path(source)
+        self._prepare(source, "upload")
         if source.is_symlink():
             self.result.skip_link(source)
             return
@@ -51,8 +153,10 @@ class TransferEngine:
         if not self.backend.browsable:
             if not source.is_file():
                 raise ValueError("TFTP 只支持指定路径的单文件传输")
-            self.backend.upload(source, target, self.progress, self.cancel)
+            progress = self._start_file(source, source.stat().st_size)
+            self.backend.upload(source, target, progress, self.cancel)
             self.result.files += 1
+            self._complete_file(source)
             return
         existing = self.backend.stat(target)
         if existing and existing.is_link:
@@ -72,10 +176,13 @@ class TransferEngine:
                 raise ValueError(f"目标存在同名文件夹：{target}")
             if self.conflict == "skip":
                 self.result.skipped += 1
+                self._start_file(source, source.stat().st_size)
+                self._complete_file(source, skipped=True)
                 return
         temporary = posixpath.join(posixpath.dirname(target), f".file-ez-{uuid.uuid4().hex}.part")
+        progress = self._start_file(source, source.stat().st_size)
         try:
-            self.backend.upload(source, temporary, self.progress, self.cancel)
+            self.backend.upload(source, temporary, progress, self.cancel)
             check_cancel(self.cancel)
             self.backend.rename(temporary, target, overwrite=bool(existing))
         finally:
@@ -85,10 +192,12 @@ class TransferEngine:
             except Exception:
                 pass
         self.result.files += 1
+        self._complete_file(source)
 
     def download(self, source: str, target: Path):
         check_cancel(self.cancel)
         target = Path(target)
+        self._prepare(source, "download")
         if target.is_symlink():
             raise ValueError(f"目标是符号链接：{target}")
         entry = self.backend.stat(source) if self.backend.browsable else None
@@ -107,21 +216,26 @@ class TransferEngine:
                 raise ValueError(f"目标存在同名文件夹：{target}")
             if self.conflict == "skip":
                 self.result.skipped += 1
+                self._start_file(source, entry.size if entry else 0)
+                self._complete_file(source, skipped=True)
                 return
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=".file-ez-", suffix=".part", dir=target.parent)
         os.close(fd)
+        progress = self._start_file(source, entry.size if entry else 0)
         try:
-            self.backend.download(source, temporary, self.progress, self.cancel)
+            self.backend.download(source, temporary, progress, self.cancel)
             check_cancel(self.cancel)
             # Recheck after the transfer in case another application created it.
             if target.is_symlink():
                 raise ValueError(f"目标变为符号链接：{target}")
             if self.conflict == "skip" and target.exists():
                 self.result.skipped += 1
+                self._complete_file(source, skipped=True)
                 return
             os.replace(temporary, target)
             self.result.files += 1
+            self._complete_file(source)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)

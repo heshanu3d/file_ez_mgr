@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import QStandardPaths, Qt, QTimer
+from PyQt5.QtCore import QEvent, QStandardPaths, Qt, QTimer
 from PyQt5.QtGui import QFont, QKeySequence
 from PyQt5.QtWidgets import (QApplication, QComboBox, QDialog, QHBoxLayout,
                              QInputDialog, QLabel, QLineEdit, QMainWindow,
@@ -64,6 +64,12 @@ class MainWindow(QMainWindow):
         self.store = ConfigStore(directory)
         self.workspace_store = WorkspaceStateStore(directory)
         self.workspace_error = None
+        self._geometry_save = QTimer(self)
+        self._geometry_save.setSingleShot(True)
+        self._geometry_save.setInterval(400)
+        self._geometry_save.timeout.connect(self.save_workspace)
+        self._restored_maximized = False
+        self._closed = False
         self.passwords = {}
         self.retired_tabs = []
         self.config_error = None
@@ -187,6 +193,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"无法恢复上次窗口，原记录已保留：{exc}")
             state = None
         if state and not self.config_error:
+            geometry = state.get("geometry")
+            if geometry:
+                self.resize(geometry["width"], geometry["height"])
+                self._restored_maximized = geometry["maximized"]
+                if self._restored_maximized:
+                    self.setWindowState(self.windowState() | Qt.WindowMaximized)
             profiles = {profile.id: profile for profile in self.profiles}
             restored = {}
             for old_index, item in enumerate(state["tabs"]):
@@ -221,7 +233,22 @@ class MainWindow(QMainWindow):
                              local_dir=tab.local.path,
                              remote_dir=tab.remote.path or (tab.profile.remote_dir if tab.profile else ""),
                              conflict=tab.conflict.currentData()))
-        self.workspace_store.save(tabs, self.tabs.currentIndex(), self.profile_combo.currentData())
+        bounds = self.normalGeometry() if self.isMaximized() else self.geometry()
+        geometry = dict(width=max(self.minimumWidth(), bounds.width()),
+                        height=max(self.minimumHeight(), bounds.height()),
+                        maximized=self.isMaximized())
+        self.workspace_store.save(tabs, self.tabs.currentIndex(),
+                                  self.profile_combo.currentData(), geometry)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.isVisible() and not self._closed:
+            self._geometry_save.start()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and self.isVisible() and not self._closed:
+            self._geometry_save.start()
 
     def open_connection(self):
         profile = self.selected_profile()
@@ -273,12 +300,16 @@ class MainWindow(QMainWindow):
             self.save_workspace()
         except Exception as exc:
             QMessageBox.warning(self, "窗口记录保存失败", f"无法记录本次窗口状态：{exc}")
+        self._geometry_save.stop()
+        self._closed = True
         for tab in tabs:
             tab.shutdown()
         event.accept()
 
     def save_workspace_on_quit(self):
         # Qt can exit its event loop without delivering a window close event.
+        if self._closed:
+            return
         try:
             self.save_workspace()
         except Exception as exc:
